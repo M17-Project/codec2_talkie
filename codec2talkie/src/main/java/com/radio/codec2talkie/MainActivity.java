@@ -6,8 +6,15 @@ import androidx.core.content.ContextCompat;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
+import android.bluetooth.BluetoothDevice;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffColorFilter;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -18,6 +25,7 @@ import android.widget.AdapterView;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.CompoundButton;
+import android.widget.ProgressBar;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -34,6 +42,8 @@ import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
 
+    private static final String TAG = MainActivity.class.getSimpleName();
+
     private final static int REQUEST_CONNECT_BT = 1;
     private final static int REQUEST_CONNECT_USB = 2;
     private final static int REQUEST_PERMISSIONS = 3;
@@ -46,8 +56,14 @@ public class MainActivity extends AppCompatActivity {
             Manifest.permission.RECORD_AUDIO
     };
 
+    static boolean _isActive = false;
+
     private TextView _textConnInfo;
     private TextView _textStatus;
+    private Spinner _spinnerCodec2Mode;
+    private ProgressBar _progressRxLevel;
+    private ProgressBar _progressTxLevel;
+    private CheckBox _checkBoxLoopback;
 
     private Codec2Player _codec2Player;
 
@@ -55,23 +71,41 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        _isActive = false;
+
         setContentView(R.layout.activity_main);
 
         _textConnInfo = findViewById(R.id.textBtName);
         _textStatus = findViewById(R.id.textStatus);
+        _progressRxLevel = findViewById(R.id.progressRxLevel);
+        _progressRxLevel.setMax(-Codec2Player.getAudioMinLevel());
+        _progressTxLevel = findViewById(R.id.progressTxLevel);
+        _progressTxLevel.setMax(-Codec2Player.getAudioMinLevel());
 
         Button btnPtt = findViewById(R.id.btnPtt);
         btnPtt.setOnTouchListener(onBtnPttTouchListener);
 
-        Spinner spinnerCodec2Mode = findViewById(R.id.spinnerCodecMode);
-        spinnerCodec2Mode.setSelection(CODEC2_DEFAULT_MODE_POS);
-        spinnerCodec2Mode.setOnItemSelectedListener(onCodecModeSelectedListener);
+        _spinnerCodec2Mode = findViewById(R.id.spinnerCodecMode);
+        _spinnerCodec2Mode.setSelection(CODEC2_DEFAULT_MODE_POS);
+        _spinnerCodec2Mode.setOnItemSelectedListener(onCodecModeSelectedListener);
 
-        CheckBox checkBoxLoopback = findViewById(R.id.checkBoxLoopback);
-        checkBoxLoopback.setOnCheckedChangeListener(onLoopbackCheckedChangeListener);
+        _checkBoxLoopback = findViewById(R.id.checkBoxLoopback);
+        _checkBoxLoopback.setOnCheckedChangeListener(onLoopbackCheckedChangeListener);
+
+        registerReceiver(onBluetoothDisconnected, new IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECTED));
 
         if (requestPermissions()) {
             startUsbConnectActivity();
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        _isActive = false;
+        if (_codec2Player != null) {
+            _codec2Player.stopRunning();
         }
     }
 
@@ -103,6 +137,15 @@ public class MainActivity extends AppCompatActivity {
         return true;
     }
 
+    private int colorFromAudioLevel(int audioLevel) {
+        int color = Color.GREEN;
+        if (audioLevel > Codec2Player.getAudioHighLevel())
+            color = Color.RED;
+        else if (audioLevel == Codec2Player.getAudioMinLevel())
+            color = Color.LTGRAY;
+        return color;
+    }
+
     private final CompoundButton.OnCheckedChangeListener onLoopbackCheckedChangeListener = new CompoundButton.OnCheckedChangeListener() {
         @Override
         public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
@@ -124,6 +167,15 @@ public class MainActivity extends AppCompatActivity {
 
         @Override
         public void onNothingSelected(AdapterView<?> parent) {
+        }
+    };
+
+    private final BroadcastReceiver onBluetoothDisconnected = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+        if (_codec2Player != null && SocketHandler.getSocket() != null) {
+            _codec2Player.stopRunning();
+        }
         }
     };
 
@@ -169,8 +221,9 @@ public class MainActivity extends AppCompatActivity {
     private final Handler onPlayerStateChanged = new Handler(Looper.getMainLooper()) {
         @Override
         public void handleMessage(Message msg) {
-            if (msg.what == Codec2Player.PLAYER_DISCONNECT) {
-                _textStatus.setText("DISC");
+            if (_isActive && msg.what == Codec2Player.PLAYER_DISCONNECT) {
+                _textStatus.setText("STOP");
+                _checkBoxLoopback.setChecked(false);
                 Toast.makeText(getBaseContext(), "Disconnected from modem", Toast.LENGTH_SHORT).show();
                 startUsbConnectActivity();
             }
@@ -183,8 +236,27 @@ public class MainActivity extends AppCompatActivity {
             else if (msg.what == Codec2Player.PLAYER_PLAYING) {
                 _textStatus.setText("RX");
             }
+            else if (msg.what == Codec2Player.PLAYER_RX_LEVEL) {
+                _progressRxLevel.getProgressDrawable().setColorFilter(new PorterDuffColorFilter(colorFromAudioLevel(msg.arg1), PorterDuff.Mode.SRC_IN));
+                _progressRxLevel.setProgress(msg.arg1 - Codec2Player.getAudioMinLevel());
+            }
+            else if (msg.what == Codec2Player.PLAYER_TX_LEVEL) {
+                _progressTxLevel.getProgressDrawable().setColorFilter(new PorterDuffColorFilter(colorFromAudioLevel(msg.arg1), PorterDuff.Mode.SRC_IN));
+                _progressTxLevel.setProgress(msg.arg1 - Codec2Player.getAudioMinLevel());
+            }
         }
     };
+
+    private void startPlayer(boolean isUsb) throws IOException {
+        _codec2Player = new Codec2Player(onPlayerStateChanged, CODEC2_DEFAULT_MODE);
+        if (isUsb) {
+            _codec2Player.setUsbPort(UsbPortHandler.getPort());
+        } else {
+            _codec2Player.setSocket(SocketHandler.getSocket());
+        }
+        _spinnerCodec2Mode.setSelection(CODEC2_DEFAULT_MODE_POS);
+        _codec2Player.start();
+    }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -194,13 +266,11 @@ public class MainActivity extends AppCompatActivity {
                 finish();
             } else if (resultCode == RESULT_OK) {
                 _textConnInfo.setText(data.getStringExtra("name"));
-                _codec2Player = new Codec2Player(onPlayerStateChanged, CODEC2_DEFAULT_MODE);
                 try {
-                    _codec2Player.setSocket(SocketHandler.getSocket());
+                    startPlayer(false);
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
-                _codec2Player.start();
             }
         }
         if (requestCode == REQUEST_CONNECT_USB) {
@@ -208,9 +278,11 @@ public class MainActivity extends AppCompatActivity {
                 startBluetoothConnectActivity();
             } else if (resultCode == RESULT_OK) {
                 _textConnInfo.setText(data.getStringExtra("name"));
-                _codec2Player = new Codec2Player(onPlayerStateChanged, CODEC2_DEFAULT_MODE);
-                _codec2Player.setUsbPort(UsbPortHandler.getPort());
-                _codec2Player.start();
+                try {
+                    startPlayer(true);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
         }
     }
